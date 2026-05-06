@@ -497,7 +497,7 @@ async function handleStream(req, res, route) {
       try {
         const payload = await fetchJson(url, STREAM_CACHE_TTL_MS);
         const streams = Array.isArray(payload.streams) ? payload.streams : [];
-        return streams.map((stream) => sanitizeStream(stream, upstream));
+        return streams.map((stream, index) => sanitizeStream(stream, upstream, index));
       } catch {
         return [];
       }
@@ -549,20 +549,13 @@ function sanitizeMeta(meta) {
   return next;
 }
 
-function sanitizeStream(stream, upstream) {
+function sanitizeStream(stream, upstream, streamIndex) {
   const next = { ...stream };
-  const fallbackTitle = [stream.name, stream.title].filter(Boolean).join("\n");
   const peerCount = getPeerCount(stream);
   setPeerCount(next, peerCount);
 
   next.name = BRAND;
-  next.title = sanitizeText(stream.title || fallbackTitle || BRAND);
-  next.title = appendPeerInfo(next.title, peerCount);
-
-  if (!next.title || next.title === BRAND) {
-    next.title = BRAND;
-    next.title = appendPeerInfo(next.title, peerCount);
-  }
+  next.title = buildStreamDisplayTitle(stream, peerCount);
 
   if (typeof stream.description === "string") {
     next.description = sanitizeText(stream.description);
@@ -577,7 +570,11 @@ function sanitizeStream(stream, upstream) {
         next.behaviorHints[key] = sanitizeText(value);
       }
     }
+  } else {
+    next.behaviorHints = {};
   }
+
+  next.behaviorHints.bingeGroup = buildStreamBingeGroup(stream, upstream, streamIndex);
 
   return next;
 }
@@ -736,16 +733,262 @@ function normalizePeerNumeric(value, suffix) {
   return `${head}.${tail}`;
 }
 
-function appendPeerInfo(title, peerCount) {
-  if (peerCount === null || titleHasPeerLabel(title)) {
-    return title;
+function buildStreamDisplayTitle(stream, peerCount) {
+  const title = extractStreamContentTitle(stream) || BRAND;
+  const quality = extractStreamQuality(stream);
+  const episode = extractStreamEpisode(stream);
+  const lines = [title];
+
+  if (quality) {
+    lines.push(`Qualidade: ${quality}`);
   }
 
-  return `${title}\nPeers: ${peerCount}`;
+  if (episode) {
+    lines.push(`Ep: ${episode}`);
+  }
+
+  if (peerCount !== null) {
+    lines.push(`Peers: ${peerCount}`);
+  }
+
+  return lines.join("\n");
 }
 
-function titleHasPeerLabel(title) {
-  return /(?:^|\n)\s*Peers:\s*[0-9]/i.test(title);
+function extractStreamContentTitle(stream) {
+  for (const value of getStreamTextValues(stream)) {
+    for (const line of value.split(/\r?\n/)) {
+      const title = extractTitleFromReleaseLine(line);
+      if (title) {
+        return title;
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractTitleFromReleaseLine(value) {
+  const line = cleanReleaseText(value);
+  if (!line || isTechnicalOnly(line)) {
+    return "";
+  }
+
+  const stopIndex = firstPatternIndex(line, [
+    /\b[Ss]\d{1,2}\s*[Ee]\d{1,3}(?:\s*[Ee]\d{1,3})?\b/,
+    /\b\d{1,2}x\d{1,3}\b/,
+    /\b(?:4320p|2160p|1080p|720p|480p|360p|8k|4k|uhd)\b/i,
+    /\b(?:web[-\s]?dl|webrip|blu[-\s]?ray|brrip|hdrip|dvdrip|remux|hdcam|camrip|cam|hdts|ts)\b/i
+  ]);
+  const yearMatch = line.match(/\b(19\d{2}|20\d{2})\b/);
+  let title = "";
+
+  if (yearMatch && yearMatch.index > 0 && (stopIndex === -1 || yearMatch.index < stopIndex)) {
+    title = `${line.slice(0, yearMatch.index).trim()} (${yearMatch[1]})`;
+  } else if (stopIndex > 0) {
+    title = line.slice(0, stopIndex).trim();
+  } else if (stopIndex === -1) {
+    title = line.trim();
+  }
+
+  title = cleanDisplayTitle(title);
+  return isUsableTitle(title) ? title : "";
+}
+
+function extractStreamQuality(stream) {
+  for (const value of getStreamTextValues(stream)) {
+    const quality = extractQualityFromText(value);
+    if (quality) {
+      return quality;
+    }
+  }
+
+  return "";
+}
+
+function extractQualityFromText(value) {
+  const text = cleanReleaseText(value);
+  const tokens = [];
+  const resolutionChecks = [
+    ["8K", /\b(?:4320p|8k)\b/i],
+    ["4K", /\b(?:2160p|4k|uhd)\b/i],
+    ["1080p", /\b1080p\b/i],
+    ["720p", /\b720p\b/i],
+    ["480p", /\b480p\b/i],
+    ["360p", /\b360p\b/i]
+  ];
+  const extraChecks = [
+    ["HDR10+", /\bHDR10\+\b/i],
+    ["HDR10", /\bHDR10\b/i],
+    ["HDR", /\bHDR\b/i],
+    ["DV", /\b(?:Dolby\s*Vision|DoVi|DV)\b/i],
+    ["REMUX", /\bREMUX\b/i],
+    ["WEB-DL", /\bWEB[-\s]?DL\b/i],
+    ["WEBRip", /\bWEB[-\s]?Rip\b/i],
+    ["BluRay", /\bBlu[-\s]?Ray\b/i],
+    ["BRRip", /\bBRRip\b/i],
+    ["HDRip", /\bHDRip\b/i],
+    ["DVDRip", /\bDVDRip\b/i],
+    ["CAM", /\b(?:HDCAM|CAMRip|CAM|HDTS|TS)\b/i],
+    ["HEVC", /\b(?:HEVC|H\.?265|x265)\b/i],
+    ["x264", /\b(?:AVC|H\.?264|x264)\b/i]
+  ];
+
+  for (const [label, pattern] of resolutionChecks) {
+    if (pattern.test(text)) {
+      tokens.push(label);
+      break;
+    }
+  }
+
+  for (const [label, pattern] of extraChecks) {
+    if (pattern.test(text) && !tokens.includes(label)) {
+      tokens.push(label);
+    }
+  }
+
+  return tokens.slice(0, 4).join(" ");
+}
+
+function extractStreamEpisode(stream) {
+  for (const value of getStreamTextValues(stream)) {
+    const episode = extractEpisodeFromText(value);
+    if (episode) {
+      return episode;
+    }
+  }
+
+  return "";
+}
+
+function extractEpisodeFromText(value) {
+  const text = cleanReleaseText(value);
+  let match = text.match(/\b[Ss](\d{1,2})\s*[Ee](\d{1,3})(?:\s*[Ee](\d{1,3}))?\b/);
+  if (match) {
+    const start = `S${padEpisodeNumber(match[1], 2)}E${padEpisodeNumber(match[2], 2)}`;
+    return match[3] ? `${start}-E${padEpisodeNumber(match[3], 2)}` : start;
+  }
+
+  match = text.match(/\b(\d{1,2})x(\d{1,3})\b/);
+  if (match) {
+    return `S${padEpisodeNumber(match[1], 2)}E${padEpisodeNumber(match[2], 2)}`;
+  }
+
+  match = text.match(/\b(?:season|temporada)\s*(\d{1,2}).*?\b(?:episode|episodio|ep)\s*(\d{1,3})\b/i);
+  if (match) {
+    return `S${padEpisodeNumber(match[1], 2)}E${padEpisodeNumber(match[2], 2)}`;
+  }
+
+  return "";
+}
+
+function padEpisodeNumber(value, size) {
+  return String(Number(value)).padStart(size, "0");
+}
+
+function getStreamTextValues(stream) {
+  if (!stream || typeof stream !== "object") {
+    return [];
+  }
+
+  const behaviorHints = stream.behaviorHints && typeof stream.behaviorHints === "object"
+    ? stream.behaviorHints
+    : {};
+
+  return [
+    behaviorHints.filename,
+    stream.filename,
+    stream.fileName,
+    stream.title,
+    stream.name,
+    stream.description,
+    behaviorHints.bingeGroup
+  ].filter((value) => typeof value === "string" && value.trim());
+}
+
+function cleanReleaseText(value) {
+  return stripSourceNames(value)
+    .replace(/magnet:\S+/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\u{1F464}\s*[0-9][0-9.,]*\s*[kKmM]?/gu, " ")
+    .replace(/\u{1F465}\s*[0-9][0-9.,]*\s*[kKmM]?/gu, " ")
+    .replace(/\u{1F4BE}\s*[0-9][0-9.,]*\s*(?:GB|GiB|MB|MiB)?/giu, " ")
+    .replace(/\b(?:peers?|seeders?|seeds?)\s*[:=\-]?\s*[0-9][0-9.,]*\s*[kKmM]?\b/gi, " ")
+    .replace(/\b(?:size|tamanho)\s*[:=\-]?\s*[0-9][0-9.,]*\s*(?:GB|GiB|MB|MiB)\b/gi, " ")
+    .replace(/\.(?:mkv|mp4|avi|mov|wmv|flv|webm)$/i, "")
+    .replace(/[._]+/g, " ")
+    .replace(/[\[\]{}]/g, " ")
+    .replace(/[|]+/g, " ")
+    .replace(/\s+-\s+/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function stripSourceNames(value) {
+  let next = String(value);
+  for (const pattern of BRAND_PATTERNS) {
+    next = next.replace(pattern, " ");
+  }
+
+  return next;
+}
+
+function cleanDisplayTitle(value) {
+  return value
+    .replace(/[._]+/g, " ")
+    .replace(/[\[\]{}]/g, " ")
+    .replace(/\s*\(\s*\)/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([:;,.!?])/g, "$1")
+    .trim();
+}
+
+function isUsableTitle(value) {
+  return Boolean(value && value.length > 1 && /[A-Za-z0-9]/.test(value) && !isTechnicalOnly(value));
+}
+
+function isTechnicalOnly(value) {
+  return /^(?:8K|4K|UHD|4320p|2160p|1080p|720p|480p|360p|HDR10\+?|HDR|DV|DoVi|WEB[-\s]?DL|WEBRip|Blu[-\s]?Ray|BRRip|HDRip|DVDRip|REMUX|HEVC|H\.?265|x265|AVC|H\.?264|x264|CAM|HDCAM|CAMRip|HDTS|TS|MULTI|DUAL|DUBBED|LEGENDADO|DUBLADO|\d+ch|AAC|AC3|DDP?5\.1|Atmos|TrueHD|DTS)(?:\s+|$)+$/i.test(value.trim());
+}
+
+function firstPatternIndex(value, patterns) {
+  let index = -1;
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match && (index === -1 || match.index < index)) {
+      index = match.index;
+    }
+  }
+
+  return index;
+}
+
+function buildStreamBingeGroup(stream, upstream, streamIndex) {
+  const behaviorHints = stream && stream.behaviorHints && typeof stream.behaviorHints === "object"
+    ? stream.behaviorHints
+    : {};
+  const sourceKey = upstream && upstream.key ? upstream.key : "";
+  const basis = [
+    sourceKey,
+    streamIndex ?? "",
+    stream && stream.infoHash,
+    stream && stream.fileIdx,
+    stream && stream.url,
+    stream && stream.externalUrl,
+    behaviorHints.filename,
+    stream && stream.title
+  ].filter((value) => value !== undefined && value !== null).join("|");
+
+  return `${BRAND}-${stableHash(basis)}`;
+}
+
+function stableHash(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
 }
 
 function sanitizeText(value) {
